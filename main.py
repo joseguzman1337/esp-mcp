@@ -1,13 +1,31 @@
 import logging
 import shlex
 import time
-from typing import Tuple
+from typing import Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 import os
-from esp_utils import run_command_async, get_export_script, list_serial_ports, get_esp_idf_dir
+from esp_utils import run_command_async, run_command_async_stream, get_export_script, list_serial_ports, get_esp_idf_dir
 
 mcp = FastMCP("esp-mcp")
+
+LOG_DIR = os.getenv("ESP_MCP_LOG_DIR", os.path.join(os.getcwd(), ".ai", "logs", "esp_mcp"))
+
+def _ensure_log_dir() -> None:
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+def _write_log(filename: str, content: str) -> None:
+    _ensure_log_dir()
+    log_path = os.path.join(LOG_DIR, filename)
+    with open(log_path, "w+") as handle:
+        handle.write(content)
+
+def _timestamped(name: str) -> str:
+    return f"{name}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+
+def _log_path(filename: str) -> str:
+    _ensure_log_dir()
+    return os.path.join(LOG_DIR, filename)
 
 @mcp.tool()
 async def build_esp_project(project_path: str, idf_path: str = None, sdkconfig_defaults: str = None) -> Tuple[str, str]:
@@ -40,7 +58,11 @@ async def build_esp_project(project_path: str, idf_path: str = None, sdkconfig_d
         build_cmd = "idf.py build"
 
     # Use double quotes for the outer command to allow single quotes in build_cmd
-    returncode, stdout, stderr = await run_command_async(f'bash -c "source {export_script} && {build_cmd}"')
+    build_log = _log_path("mcp-process-live.log")
+    returncode, stdout, stderr = await run_command_async_stream(
+        f'bash -c "source {export_script} && {build_cmd}"',
+        build_log,
+    )
 
     # Calculate elapsed time
     elapsed_time = time.time() - start_time
@@ -51,7 +73,8 @@ async def build_esp_project(project_path: str, idf_path: str = None, sdkconfig_d
     timing_info = f"\n\n[Build completed in {elapsed_minutes}m {elapsed_seconds:.2f}s ({elapsed_time:.2f} seconds)]\n"
     stdout_with_timing = stdout + timing_info
 
-    open('mcp-process.log', 'w+').write(str((stdout, stderr)))
+    _write_log("mcp-process.log", str((stdout, stderr)))
+    _write_log(_timestamped("mcp-process"), str((stdout, stderr)))
     logging.warning(f"build result - elapsed: {elapsed_time:.2f}s, return code: {returncode}, stdout: {stdout[:200]}..., stderr: {stderr[:200]}...")
     return stdout_with_timing, stderr
 
@@ -77,8 +100,13 @@ async def setup_project_esp_target(project_path: str, target: str, idf_path: str
     processed_idf_path = idf_path if (idf_path and idf_path.strip()) else None
     logging.warning(f"processed_idf_path={processed_idf_path}")
     export_script = get_export_script(processed_idf_path)
-    returncode, stdout, stderr = await run_command_async(f"bash -c 'source {export_script} && idf.py set-target {target}'")
-    open('mcp-set-target.log', 'w+').write(str((stdout, stderr)))
+    target_log = _log_path("mcp-set-target-live.log")
+    returncode, stdout, stderr = await run_command_async_stream(
+        f"bash -c 'source {export_script} && idf.py set-target {target}'",
+        target_log,
+    )
+    _write_log("mcp-set-target.log", str((stdout, stderr)))
+    _write_log(_timestamped("mcp-set-target"), str((stdout, stderr)))
     logging.warning(f"build result {stdout} {stderr}")
     return stdout, stderr
 
@@ -99,19 +127,25 @@ async def create_esp_project(project_path: str, project_name: str) -> Tuple[str,
     os.makedirs(project_path, exist_ok=True)
     os.chdir(project_path)
     export_script = get_export_script()
-    returncode, stdout, stderr = await run_command_async(f"bash -c 'source {export_script} && idf.py create-project --path {project_path} {project_name}'")
-    open('mcp-project-root-path.log', 'w+').write(str((stdout, stderr)))
+    create_log = _log_path("mcp-project-root-path-live.log")
+    returncode, stdout, stderr = await run_command_async_stream(
+        f"bash -c 'source {export_script} && idf.py create-project --path {project_path} {project_name}'",
+        create_log,
+    )
+    _write_log("mcp-project-root-path.log", str((stdout, stderr)))
+    _write_log(_timestamped("mcp-project-root-path"), str((stdout, stderr)))
     logging.warning(f"build result {stdout} {stderr}")
     return stdout, stderr
 
 
 @mcp.tool()
-async def flash_esp_project(project_path: str, port: str = None) -> Tuple[str, str]:
+async def flash_esp_project(project_path: str, port: str = None, port_filter: str = None) -> Tuple[str, str]:
     """Flash built firmware to a connected ESP device.
 
     Args:
         project_path: Path to the ESP-IDF project
         port: Serial port for the ESP device (optional, auto-detect if not provided)
+        port_filter: Optional esptool/idf.py port filter (e.g., "vid=0x303A" or "vid=0x303A,pid=0x0002")
 
     Returns:
         tuple: (stdout, stderr) - Flash logs and any error messages
@@ -119,33 +153,71 @@ async def flash_esp_project(project_path: str, port: str = None) -> Tuple[str, s
     os.chdir(project_path)
     export_script = get_export_script()
 
+    retries = int(os.environ.get("ESP_MCP_FLASH_RETRIES", "10"))
+    delay = float(os.environ.get("ESP_MCP_FLASH_RETRY_DELAY", "1.0"))
+
     # Build the flash command
     if port:
-        flash_cmd = f"bash -c 'source {export_script} && idf.py -p {port} flash'"
+        port_quoted = shlex.quote(port)
+        flash_cmd = f"bash -c 'source {export_script} && idf.py -p {port_quoted} flash'"
+        port_lower = port.lower()
+        if "usbmodem" in port_lower or "ttyacm" in port_lower:
+            logging.warning(f"flash transport: usb-c cdc ({port})")
+        elif "ttyusb" in port_lower or "usbserial" in port_lower or "com" in port_lower:
+            logging.warning(f"flash transport: serial ({port})")
+        else:
+            logging.warning(f"flash transport: unknown ({port})")
+    elif port_filter:
+        filter_quoted = shlex.quote(port_filter)
+        flash_cmd = f"bash -c 'source {export_script} && idf.py -p auto --port-filter {filter_quoted} flash'"
+        logging.warning(f"flash transport: auto (filter={port_filter})")
     else:
         flash_cmd = f"bash -c 'source {export_script} && idf.py flash'"
+        logging.warning("flash transport: auto (no filter)")
 
-    returncode, stdout, stderr = await run_command_async(flash_cmd)
+    flash_log_path = _log_path("mcp-flash-live.log")
+    returncode = 1
+    stdout = ""
+    stderr = ""
+    for attempt in range(1, retries + 1):
+        returncode, stdout, stderr = await run_command_async_stream(flash_cmd, flash_log_path)
+        if returncode == 0:
+            break
+        logging.warning(f"flash attempt {attempt}/{retries} failed; retrying in {delay}s")
+        time.sleep(delay)
 
     # Log the flash operation
     flash_log = f"Flash operation - Return code: {returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    open('mcp-flash.log', 'w+').write(flash_log)
+    _write_log("mcp-flash.log", flash_log)
+    _write_log(_timestamped("mcp-flash"), flash_log)
     logging.warning(f"flash result - return code: {returncode}, stdout: {stdout}, stderr: {stderr}")
 
     return stdout, stderr
 
 @mcp.tool()
-async def list_esp_serial_ports() -> Tuple[str, str]:
+async def list_esp_serial_ports(vid: Optional[str] = None, pid: Optional[str] = None) -> Tuple[str, str]:
     """List available serial ports for ESP devices.
 
     Returns:
         tuple: (stdout, stderr) - Available serial ports and any error messages
     """
-    returncode, stdout, stderr = await list_serial_ports()
+    def parse_usb_id(value: Optional[str]) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value, 0)
+        except (TypeError, ValueError):
+            return None
+
+    vid_int = parse_usb_id(vid)
+    pid_int = parse_usb_id(pid)
+
+    returncode, stdout, stderr = await list_serial_ports(vid=vid_int, pid=pid_int)
 
     # Log the port listing operation
     port_log = f"Port listing - Return code: {returncode}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    open('mcp-ports.log', 'w+').write(port_log)
+    _write_log("mcp-ports.log", port_log)
+    _write_log(_timestamped("mcp-ports"), port_log)
     logging.warning(f"port listing result - return code: {returncode}, stdout: {stdout}, stderr: {stderr}")
 
     return stdout, stderr
@@ -185,7 +257,11 @@ async def run_esp_idf_install(idf_path: str = None) -> Tuple[str, str]:
     original_dir = os.getcwd()
     try:
         os.chdir(esp_idf_dir)
-        returncode, stdout, stderr = await run_command_async(f"bash {install_script}")
+        install_log_path = _log_path("mcp-install-live.log")
+        returncode, stdout, stderr = await run_command_async_stream(
+            f"bash {install_script}",
+            install_log_path,
+        )
 
         # Calculate elapsed time
         elapsed_time = time.time() - start_time
@@ -198,7 +274,8 @@ async def run_esp_idf_install(idf_path: str = None) -> Tuple[str, str]:
 
         # Log the installation operation
         install_log = f"ESP-IDF installation - Elapsed time: {elapsed_time:.2f}s ({elapsed_minutes}m {elapsed_seconds:.2f}s)\nReturn code: {returncode}\nESP-IDF path: {esp_idf_dir}\nInstall script: {install_script}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        open('mcp-install.log', 'w+').write(install_log)
+        _write_log("mcp-install.log", install_log)
+        _write_log(_timestamped("mcp-install"), install_log)
         logging.warning(f"install.sh result - elapsed: {elapsed_time:.2f}s, return code: {returncode}, stdout: {stdout[:200]}..., stderr: {stderr[:200]}...")
 
         return stdout_with_timing, stderr
@@ -243,11 +320,12 @@ async def run_pytest(project_path: str, test_path: str = ".", pytest_args: str =
 
         full_cmd = f"bash -c 'source {export_script} && {pytest_cmd}'"
 
-        returncode, stdout, stderr = await run_command_async(full_cmd)
+        pytest_log_path = _log_path("mcp-pytest-live.log")
+        returncode, stdout, stderr = await run_command_async_stream(full_cmd, pytest_log_path)
 
         # Log the pytest operation
         pytest_log = f"Pytest execution - Return code: {returncode}\nCommand: {full_cmd}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        open('mcp-pytest.log', 'w+').write(pytest_log)
+        _write_log("mcp-pytest.log", pytest_log)
         logging.warning(f"pytest result - return code: {returncode}, stdout: {stdout}, stderr: {stderr}")
 
         return stdout, stderr
